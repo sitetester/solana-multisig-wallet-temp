@@ -24,7 +24,6 @@ fn debug_print(text: &str) {
     println!("=== {text} ===");
 }
 
-
 #[tokio::test]
 async fn test_complete_multisig_flow() {
     debug_print("Starting test_complete_multisig_flow");
@@ -40,9 +39,6 @@ async fn test_complete_multisig_flow() {
     );
 
     let mut context: ProgramTestContext = program_test.start_with_context().await;
-
-    // let mut ctx = ContextHelper::new(program_test).await;
-    // let mut context = context;
 
     let owner1_keypair = Keypair::new();
     let owner2_keypair = Keypair::new();
@@ -71,9 +67,9 @@ async fn test_complete_multisig_flow() {
     let rent_cost = rent.minimum_balance(space);
 
     // the amount (in lamports) we want to transfer later (in these tests to another account)
-    let execute_amount = 50;
+    let transfer_amount = 50;
     // total amount (like a prepaid card, activation + spending). Need both.
-    let lamports = rent_cost + execute_amount;
+    let lamports = rent_cost + transfer_amount;
 
     let multisig_keypair = Keypair::new();
     let multisig_key = multisig_keypair.pubkey();
@@ -211,77 +207,86 @@ async fn test_complete_multisig_flow() {
     // ---------------------------------------------------------------------
     debug_print("3. EXECUTE TRANSACTION");
 
-    println!("\n=== Attempting Execute (Should Fail) ===");
+    // first we create the destination account
     let destination_keypair = Keypair::new();
-    let execute_destination = destination_keypair.pubkey();
+    let recipient_key = destination_keypair.pubkey();
 
     // minimum_balance(0) is the minimum possible rent cost (there is no data storage), it just holds SOL
     let destination_minimum_rent = rent.minimum_balance(0);
 
-    // Create destination account with system program
-    let create_destination_ix = solana_sdk::system_instruction::create_account(
+    // let's create a new account to receive SOL from the multisig execution
+    let create_destination_account_instr = solana_sdk::system_instruction::create_account(
         &context.payer.pubkey(),
-        &execute_destination,
-        destination_minimum_rent, // Ensure rent-exempt
-        0,               // No data
-        &system_program::id(),
+        &recipient_key,           // new account address
+        destination_minimum_rent, // lamports to ensure rent-exempt
+        0,                        // space (0 because just holding SOL, no program data needed)
+        &system_program::id(),    // owner (system program owns SOL accounts)
     );
 
-    // Create and send transaction to create destination account
+    // create and send transaction to create destination account
     let create_dest_tx = Transaction::new_signed_with_payer(
-        &[create_destination_ix],
+        &[create_destination_account_instr],
         Some(&context.payer.pubkey()),
-        &[&context.payer, &destination_keypair],
+        &[
+            // payer must sign because it's paying for fees (tx fee & initial rent-exempt balance)
+            // system program needs proof that the payer authorized this payment
+            &context.payer,
+            // new account must sign for its creation, signature proves you have the private key for this new account
+            &destination_keypair,
+        ],
+        // prevents replay attacks, also block hashes are only valid for a limited time window ~2 minutes (150 blocks)
         context.last_blockhash,
     );
-
-    // Process destination account creation
     context
         .banks_client
         .process_transaction(create_dest_tx)
         .await
         .unwrap();
 
-    // Verify destination account was created
-    let dest_account = ctx_get_account(&mut context, execute_destination).await;
+    // verify destination account was created
+    let dest_account = ctx_get_account(&mut context, recipient_key).await;
     assert_eq!(
         dest_account.lamports, destination_minimum_rent,
         "Destination account should be rent-exempt"
     );
 
-    // Create execute instruction
-    let execute_instruction = MultisigInstruction::Execute {
-        amount: execute_amount,
-        destination: execute_destination,
-    };
-    let mut execute_instruction_data = vec![];
-    execute_instruction
-        .serialize(&mut execute_instruction_data)
-        .unwrap();
+    // ----------------------------------------------------------------
+    // destination account created, next testing multisig transfer flow
+    // ----------------------------------------------------------------
 
-    // First execute attempt (should fail due to insufficient signatures)
-    let execute_ix = solana_sdk::instruction::Instruction::new_with_bytes(
+    // create execute instruction (`Execute` variant of MultisigInstruction enum)
+    let multisig_instr_execute = MultisigInstruction::Execute {
+        amount: transfer_amount,
+        destination: recipient_key,
+    };
+    let execute_instruction_data = multisig_instr_execute.try_to_vec().unwrap();
+
+    // represents the instruction to execute the multisig transfer
+    // first execute attempt (should fail due to insufficient signatures)
+    println!("\n=== Calling `Execute` instruction (should fail as multisig_key owner didn't sign tx) ===");
+
+    let multisig_execute_instr = solana_sdk::instruction::Instruction::new_with_bytes(
         program_id,
         &execute_instruction_data,
         vec![
-            AccountMeta::new(multisig_key, false),
-            AccountMeta::new(execute_destination, false),
+            // `is_signer = false` means this account must be signed at transaction level (but later only payer signs tx)
+            AccountMeta::new(multisig_key, false), // will fail, owner didn't sign
+            AccountMeta::new(recipient_key, false), // signature not needed
+            // system program never signs,
+            // needed for native SOL transfers
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-
-    let execute_tx = Transaction::new_signed_with_payer(
-        &[execute_ix],
+    let multisig_execute_tx = Transaction::new_signed_with_payer(
+        &[multisig_execute_instr],
         Some(&context.payer.pubkey()),
-        &[&context.payer],
+        &[&context.payer], // only payer signs here, hence it will fail
         context.last_blockhash,
     );
-
-    let result = context.banks_client.process_transaction(execute_tx).await;
-
+    let result = context.banks_client.process_transaction(multisig_execute_tx).await; // submit tx
     assert!(
         result.is_err(),
-        "Execute should fail with insufficient signatures"
+        "`Execute` should fail with insufficient signatures as multisig_key has not yet signed"
     );
 
     // Second owner signs
@@ -313,7 +318,7 @@ async fn test_complete_multisig_flow() {
 
     // Record initial balances
     let initial_multisig_balance = ctx_get_account(&mut context, multisig_key).await.lamports;
-    let initial_destination_balance = ctx_get_account(&mut context, execute_destination).await.lamports;
+    let initial_destination_balance = ctx_get_account(&mut context, recipient_key).await.lamports;
 
     // Get fresh blockhash for final execute
     let recent_blockhash = context.banks_client.get_latest_blockhash().await.unwrap();
@@ -325,7 +330,7 @@ async fn test_complete_multisig_flow() {
         &execute_instruction_data,
         vec![
             AccountMeta::new(multisig_key, false),
-            AccountMeta::new(execute_destination, false),
+            AccountMeta::new(recipient_key, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
@@ -345,18 +350,18 @@ async fn test_complete_multisig_flow() {
 
     // Verify final state
     let final_multisig_account = ctx_get_account(&mut context, multisig_key).await;
-    let final_destination_account = ctx_get_account(&mut context, execute_destination).await;
+    let final_destination_account = ctx_get_account(&mut context, recipient_key).await;
 
     // Verify balances
     assert_eq!(
         final_destination_account.lamports,
-        initial_destination_balance + execute_amount,
+        initial_destination_balance + transfer_amount,
         "Destination balance incorrect"
     );
 
     assert_eq!(
         final_multisig_account.lamports,
-        initial_multisig_balance - execute_amount,
+        initial_multisig_balance - transfer_amount,
         "Multisig balance incorrect"
     );
 
@@ -369,7 +374,6 @@ async fn test_complete_multisig_flow() {
 
     debug_print("3. EXECUTE TRANSACTION - DONE");
 }
-
 
 async fn ctx_get_account(context: &mut ProgramTestContext, address: Pubkey) -> Account {
     context
