@@ -283,7 +283,11 @@ async fn test_complete_multisig_flow() {
         &[&context.payer], // only payer signs here, hence it will fail
         context.last_blockhash,
     );
-    let result = context.banks_client.process_transaction(multisig_execute_tx).await; // submit tx
+    // submit tx
+    let result = context
+        .banks_client
+        .process_transaction(multisig_execute_tx)
+        .await;
     assert!(
         result.is_err(),
         "`Execute` should fail with insufficient signatures as multisig_key has not yet signed"
@@ -294,7 +298,8 @@ async fn test_complete_multisig_flow() {
     let sign_ix_2 = solana_sdk::instruction::Instruction::new_with_bytes(
         program_id,
         &sign_instr_bytes,
-        vec![ // order matters (because of `process_sign()` logic)
+        vec![
+            // order matters (because of `process_sign()` logic)
             AccountMeta::new_readonly(owner2_keypair.pubkey(), true),
             AccountMeta::new(multisig_key, false),
         ],
