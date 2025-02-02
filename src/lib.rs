@@ -83,7 +83,6 @@ fn process_create(
 }
 
 fn process_sign(account_info_iter: &mut Iter<AccountInfo>,) -> ProgramResult {
-
     let signer = next_account_info(account_info_iter)?;
     let multisig_account = next_account_info(account_info_iter)?;
 

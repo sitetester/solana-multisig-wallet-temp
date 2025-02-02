@@ -294,7 +294,7 @@ async fn test_complete_multisig_flow() {
     let sign_ix_2 = solana_sdk::instruction::Instruction::new_with_bytes(
         program_id,
         &sign_instr_bytes,
-        vec![
+        vec![ // order matters (because of `process_sign()` logic)
             AccountMeta::new_readonly(owner2_keypair.pubkey(), true),
             AccountMeta::new(multisig_key, false),
         ],
